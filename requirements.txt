@@ -3,3 +3,5 @@ numpy==1.26.4
 opencv-python==4.8.0.76
 gunicorn==21.2.0
 requests==2.31.0
+aiohttp
+asyncio
