@@ -4,8 +4,13 @@ import os
 import threading
 import json
 import math
+import logging
 from gevent import pywsgi
 from geventwebsocket.handler import WebSocketHandler
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 sockets = Sockets(app)
@@ -29,6 +34,7 @@ def pixel_to_global(x_pixel, y_pixel):
     """Convert pixel coordinates to global coordinates"""
     with coords_lock:
         if camera_coords is None:
+            logger.warning("No camera coordinates available")
             return None  # No coordinates available
 
         # Camera global position
@@ -95,6 +101,8 @@ def index():
                 }).then(response => response.json())
                   .then(data => {
                       console.log('Point added:', data);
+                  }).catch(error => {
+                      console.error('Error adding point:', error);
                   });
             });
 
@@ -108,6 +116,8 @@ def index():
                       console.log('Outage points sent:', data);
                       // Clear canvas after sending
                       ctx.clearRect(0, 0, canvas.width, canvas.height);
+                  }).catch(error => {
+                      console.error('Error sending outage points:', error);
                   });
             });
         </script>
@@ -119,6 +129,7 @@ def index():
 def upload_frame():
     global latest_frame, camera_coords
     if 'frame' not in request.files:
+        logger.error("No frame uploaded")
         return "No frame uploaded", 400
     frame = request.files['frame'].read()
     with frame_lock:
@@ -126,6 +137,7 @@ def upload_frame():
     if 'camera_coords' in request.form:
         with coords_lock:
             camera_coords = json.loads(request.form['camera_coords'])
+            logger.info(f"Received camera_coords: {camera_coords}")
     return "Frame received", 200
 
 @app.route('/add_point', methods=['POST'])
@@ -137,17 +149,29 @@ def add_point():
     global_pos = pixel_to_global(x_pixel, y_pixel)
     if global_pos:
         outage_points.append(global_pos)
+        logger.info(f"Added point: {global_pos}")
         return jsonify({"status": "success", "point": global_pos}), 200
+    logger.warning("Failed to add point: No camera coords")
     return jsonify({"status": "error", "message": "No camera coords"}), 400
 
 @app.route('/send_outage', methods=['POST'])
 def send_outage():
     global outage_points, websocket_clients
     points_to_send = outage_points.copy()
+    logger.info(f"Sending outage points: {points_to_send}")
+    if not websocket_clients:
+        logger.warning("No WebSocket clients connected")
+        return jsonify({"status": "error", "message": "No WebSocket clients connected"}), 400
     for ws in websocket_clients[:]:  # Copy to avoid modification during iteration
         if not ws.closed:
-            ws.send(json.dumps({"points": points_to_send}))
+            try:
+                ws.send(json.dumps({"points": points_to_send}))
+                logger.info("Sent points to WebSocket client")
+            except Exception as e:
+                logger.error(f"Error sending to WebSocket client: {e}")
+                websocket_clients.remove(ws)
         else:
+            logger.info("Removing closed WebSocket client")
             websocket_clients.remove(ws)
     outage_points = []  # Clear after sending
     return jsonify({"status": "success", "points": points_to_send}), 200
@@ -155,13 +179,18 @@ def send_outage():
 @sockets.route('/outage_ws')
 def outage_socket(ws):
     global websocket_clients
+    logger.info("New WebSocket client connected")
     websocket_clients.append(ws)
     try:
         while not ws.closed:
             message = ws.receive()
-            # Handle client messages if needed
+            if message:
+                logger.info(f"Received WebSocket message: {message}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
     finally:
         if ws in websocket_clients:
+            logger.info("WebSocket client disconnected")
             websocket_clients.remove(ws)
 
 def generate_frames():
