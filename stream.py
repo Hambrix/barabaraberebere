@@ -1,143 +1,190 @@
-import cv2
-import aiohttp
-import asyncio
-import time
-from pioneer_sdk import Camera, Pioneer
+from flask import Flask, Response, request, jsonify
+import os
 import threading
-import queue
 import json
+import math
+from aiohttp import web, WSMsgType
+import asyncio
 
-# Configuration
-SERVER_URL = "https://barabaraberebere.onrender.com/upload"  # Replace with Render URL
-WEBSOCKET_URL = "https://barabaraberebere.onrender.com/outage_ws"  # WebSocket for outage array
-JPEG_QUALITY = 22  # Low quality for minimal size
-CAMERA_IP = "127.0.0.1"  # Drone camera IP
-CAMERA_PORT = 18000  # Camera port
-MAVLINK_PORT = 8000  # Pioneer MAVLink port
-FPS = 10  # Target 10 FPS
+app = Flask(__name__)
 
-# Read camera global coordinates from droneinit.txt
-try:
-    with open("droneinit.txt", "r") as f:
-        lines = f.readlines()
-        camera_coords = [float(lines[0].strip()), float(lines[1].strip())]  # [X, Y]
-except Exception as e:
-    print(f"Error reading droneinit.txt: {e}")
-    exit()
+# Store latest frame and coordinates (thread-safe)
+latest_frame = None
+frame_lock = threading.Lock()
+camera_coords = None  # [X, Y]
+coords_lock = threading.Lock()
+outage_points = []  # [[x, y], ...]
+websocket = None  # Store WebSocket connection
 
-# Initialize camera and Pioneer
-try:
-    camera = Camera(ip=CAMERA_IP, port=CAMERA_PORT)
-    pioneer = Pioneer(ip=CAMERA_IP, mavlink_port=MAVLINK_PORT, log_connection=False)
-except Exception as e:
-    print(f"Error initializing Camera or Pioneer: {e}")
-    exit()
+# Camera parameters
+ALTITUDE = 25.0  # meters
+HFOV_DEG = 95.0  # horizontal FOV in degrees
+VFOV_DEG = 75.0  # vertical FOV in degrees
+CANVAS_WIDTH = 640  # pixels
+CANVAS_HEIGHT = 480  # pixels
 
-# Queues for encoding and sending
-encode_queue = queue.Queue(maxsize=10)
-send_queue = queue.Queue(maxsize=10)
+def pixel_to_global(x_pixel, y_pixel):
+    """Convert pixel coordinates to global coordinates"""
+    with coords_lock:
+        if camera_coords is None:
+            return None  # No coordinates available
 
-def encode_frames():
-    """Thread to encode frames as JPEG"""
-    while True:
-        try:
-            frame, frame_id = encode_queue.get(timeout=1)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-            ret, buffer = cv2.imencode('.jpg', frame, encode_param)
-            if ret:
-                send_queue.put((buffer.tobytes(), frame_id))
-            encode_queue.task_done()
-        except queue.Empty:
-            continue
-        except KeyboardInterrupt:
-            break
+        # Camera global position
+        camera_x, camera_y = camera_coords
 
-async def send_frame(session, buffer, frame_id):
-    """Async function to send frame and coordinates to server"""
+        # Convert FOV to radians
+        hfov_rad = math.radians(HFOV_DEG)
+        vfov_rad = math.radians(VFOV_DEG)
+
+        # Ground coverage (meters) at altitude
+        ground_width = 2 * ALTITUDE * math.tan(hfov_rad / 2)
+        ground_height = 2 * ALTITUDE * math.tan(vfov_rad / 2)
+
+        # Pixel to ground coordinates (relative to image center)
+        x_rel = ((x_pixel - CANVAS_WIDTH / 2) / CANVAS_WIDTH) * ground_width
+        y_rel = ((CANVAS_HEIGHT / 2 - y_pixel) / CANVAS_HEIGHT) * ground_height
+
+        # Global coordinates
+        global_x = camera_x + x_rel
+        global_y = camera_y + y_rel
+
+        return [global_x, global_y]
+
+@app.route('/')
+def index():
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Webcam Stream</title>
+        <style>
+            #videoCanvas { position: absolute; top: 50px; left: 50px; }
+            #overlayCanvas { position: absolute; top: 50px; left: 50px; }
+            #sendButton { position: absolute; top: 550px; left: 50px; }
+        </style>
+    </head>
+    <body>
+        <h1>Live Drone Camera Stream</h1>
+        <img src="/video_feed" width="640" height="480" id="videoCanvas">
+        <canvas id="overlayCanvas" width="640" height="480"></canvas>
+        <button id="sendButton">Send Outage Points</button>
+        <script>
+            const video = document.getElementById('videoCanvas');
+            const canvas = document.getElementById('overlayCanvas');
+            const ctx = canvas.getContext('2d');
+            const sendButton = document.getElementById('sendButton');
+
+            canvas.addEventListener('click', (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+
+                // Draw red dot
+                ctx.fillStyle = 'red';
+                ctx.beginPath();
+                ctx.arc(x, y, 5, 0, 2 * Math.PI);
+                ctx.fill();
+
+                // Send click coordinates to server
+                fetch('/add_point', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: x, y: y})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Point added:', data);
+                  });
+            });
+
+            sendButton.addEventListener('click', () => {
+                fetch('/send_outage', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Outage points sent:', data);
+                      // Clear canvas after sending
+                      ctx.clearRect(0, 0, canvas.width, canvas.height);
+                  });
+            });
+        </script>
+    </body>
+    </html>
+    '''
+
+@app.route('/upload', methods=['POST'])
+def upload_frame():
+    global latest_frame, camera_coords
+    if 'frame' not in request.files:
+        return "No frame uploaded", 400
+    frame = request.files['frame'].read()
+    with frame_lock:
+        latest_frame = frame
+    if 'camera_coords' in request.form:
+        with coords_lock:
+            camera_coords = json.loads(request.form['camera_coords'])
+    return "Frame received", 200
+
+@app.route('/add_point', methods=['POST'])
+def add_point():
+    global outage_points
+    data = request.get_json()
+    x_pixel = data['x']
+    y_pixel = data['y']
+    global_pos = pixel_to_global(x_pixel, y_pixel)
+    if global_pos:
+        outage_points.append(global_pos)
+        return jsonify({"status": "success", "point": global_pos}), 200
+    return jsonify({"status": "error", "message": "No camera coords"}), 400
+
+@app.route('/send_outage', methods=['POST'])
+async def send_outage():
+    global outage_points, websocket
+    if websocket and not websocket.closed:
+        points_to_send = outage_points.copy()
+        await websocket.send_json({"points": points_to_send})
+        outage_points = []  # Clear after sending
+        return jsonify({"status": "success", "points": points_to_send}), 200
+    return jsonify({"status": "error", "message": "No WebSocket connection"}), 400
+
+async def websocket_handler(request):
+    global websocket
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    websocket = ws
     try:
-        form_data = aiohttp.FormData()
-        form_data.add_field("frame", buffer, filename="frame.jpg", content_type="image/jpeg")
-        form_data.add_field("camera_coords", json.dumps(camera_coords))
-        async with session.post(SERVER_URL, data=form_data) as response:
-            if response.status == 200:
-                print(f"Frame {frame_id} sent successfully (size: {len(buffer)} bytes)")
-            else:
-                print(f"Frame {frame_id} failed: {response.status}")
-    except Exception as e:
-        print(f"Error sending frame {frame_id}: {e}")
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                # Handle client messages if needed
+                pass
+            elif msg.type == WSMsgType.ERROR:
+                print(f"WebSocket error: {ws.exception()}")
+    finally:
+        websocket = None
+    return ws
 
-async def receive_outage():
-    """Receive outage array via WebSocket"""
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(WEBSOCKET_URL) as ws:
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
-                        points = data.get("points", [])
-                        if points:
-                            # Save outage points to file
-                            with open("outage_points.txt", "w") as f:
-                                for x, y in points:
-                                    f.write(f"{x} {y}\n")
-                            print(f"Saved outage points: {points}")
-                    except Exception as e:
-                        print(f"Error processing outage array: {e}")
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    print(f"WebSocket error: {ws.exception()}")
+# Integrate aiohttp with Flask
+def run_aiohttp():
+    aio_app = web.Application()
+    aio_app.router.add_get('/outage_ws', websocket_handler)
+    web.run_app(aio_app, host='0.0.0.0', port=int(os.environ.get('WS_PORT', 8080)))
 
-async def main():
-    # Start encoding thread
-    encode_thread = threading.Thread(target=encode_frames, daemon=True)
-    encode_thread.start()
+def generate_frames():
+    global latest_frame
+    while True:
+        with frame_lock:
+            if latest_frame is not None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + latest_frame + b'\r\n')
+        time.sleep(0.05)
 
-    # Start WebSocket receiver task
-    outage_task = asyncio.create_task(receive_outage())
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    # Initialize async HTTP session for sending
-    async with aiohttp.ClientSession() as session:
-        frame_id = 0
-        try:
-            while True:
-                start_time = time.time()
-
-                # Capture frame
-                frame = camera.get_cv_frame()
-                if frame is None:
-                    print(f"Warning: Failed to fetch frame {frame_id}.")
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # Use full 640x480 resolution
-                # frame.shape is (480, 640, 3)
-
-                # Put frame in encoding queue
-                try:
-                    encode_queue.put_nowait((frame, frame_id))
-                except queue.Full:
-                    print(f"Warning: Encode queue full, dropping frame {frame_id}.")
-
-                # Send any ready frames
-                while not send_queue.empty():
-                    buffer, sent_frame_id = send_queue.get_nowait()
-                    await send_frame(session, buffer, sent_frame_id)
-                    send_queue.task_done()
-
-                # Control FPS
-                elapsed = time.time() - start_time
-                sleep_time = max(0, (1 / FPS) - elapsed)
-                await asyncio.sleep(sleep_time)
-
-                frame_id += 1
-
-        except KeyboardInterrupt:
-            print("Stopping client")
-            outage_task.cancel()
-
-# Run async main
-try:
-    asyncio.run(main())
-finally:
-    # Cleanup
-    del camera
-    pioneer.close_connection()
+if __name__ == '__main__':
+    # Start aiohttp server in a separate thread
+    threading.Thread(target=run_aiohttp, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
