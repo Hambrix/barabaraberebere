@@ -62,10 +62,10 @@ def index():
         </style>
     </head>
     <body>
-        <h1>Live Drone Camera Stream</h1>
+        <h1>‎ ‎ ‎ ‎ ‎ ‎ </h1>
         <img src="/video_feed" width="640" height="480" id="videoCanvas">
         <canvas id="overlayCanvas" width="640" height="480"></canvas>
-        <button id="sendButton">Send Outage Points</button>
+        <button id="sendButton">‎ ‎ ‎ ‎ ‎ ‎ ‎ </button>
         <script>
             const video = document.getElementById('videoCanvas');
             const canvas = document.getElementById('overlayCanvas');
