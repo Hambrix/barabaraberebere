@@ -15,7 +15,7 @@ coords_lock = threading.Lock()
 outage_points = []  # [[x, y], ...]
 
 # Camera parameters
-ALTITUDE = 25.0  # meters
+ALTITUDE = 40.0  # meters
 HFOV_DEG = 95.0  # horizontal FOV in degrees
 VFOV_DEG = 75.0  # vertical FOV in degrees
 CANVAS_WIDTH = 640  # pixels
