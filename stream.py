@@ -81,7 +81,7 @@ def index():
                 // Draw red dot
                 ctx.fillStyle = 'red';
                 ctx.beginPath();
-                ctx.arc(x, y, 5, 0, 2 * Math.PI);
+                ctx.arc(x, y, 3, 0, 2 * Math.PI);
                 ctx.fill();
 
                 // Send click coordinates to server
