@@ -13,6 +13,8 @@ frame_lock = threading.Lock()
 camera_coords = None  # [X, Y]
 coords_lock = threading.Lock()
 outage_points = []  # [[x, y], ...]
+yaw_enabled = False  # Track yaw state
+yaw_lock = threading.Lock()
 
 # Camera parameters
 ALTITUDE = 40.0  # meters
@@ -20,9 +22,10 @@ HFOV_DEG = 95.0  # horizontal FOV in degrees
 VFOV_DEG = 75.0  # vertical FOV in degrees
 CANVAS_WIDTH = 640  # pixels
 CANVAS_HEIGHT = 480  # pixels
+Y_OFFSET = 5.0  # meters to shift points downward (from previous version)
 
 def pixel_to_global(x_pixel, y_pixel):
-    """Convert pixel coordinates to global coordinates"""
+    """Convert pixel coordinates to global coordinates, accounting for yaw"""
     with coords_lock:
         if camera_coords is None:
             return None  # No coordinates available
@@ -39,12 +42,22 @@ def pixel_to_global(x_pixel, y_pixel):
         ground_height = 2 * ALTITUDE * math.tan(vfov_rad / 2)
 
         # Pixel to ground coordinates (relative to image center)
-        x_rel = ((x_pixel - CANVAS_WIDTH / 2) / CANVAS_WIDTH) * ground_width
-        y_rel = ((CANVAS_HEIGHT / 2 - y_pixel) / CANVAS_HEIGHT) * ground_height
+        x_rel_no_yaw = ((x_pixel - CANVAS_WIDTH / 2) / CANVAS_WIDTH) * ground_width
+        y_rel_no_yaw = ((CANVAS_HEIGHT / 2 - y_pixel) / CANVAS_HEIGHT) * ground_height
+
+        with yaw_lock:
+            if yaw_enabled:
+                # Yawed -90 degrees: width (x) -> Y, height (y) -> -X
+                x_rel = -y_rel_no_yaw
+                y_rel = x_rel_no_yaw
+            else:
+                # No yaw: default mapping
+                x_rel = x_rel_no_yaw
+                y_rel = y_rel_no_yaw
 
         # Global coordinates
         global_x = camera_x + x_rel
-        global_y = camera_y + y_rel
+        global_y = camera_y + y_rel - Y_OFFSET  # Apply downward shift
 
         return [global_x, global_y]
 
@@ -58,18 +71,31 @@ def index():
         <style>
             #videoCanvas { position: absolute; top: 50px; left: 50px; }
             #overlayCanvas { position: absolute; top: 50px; left: 50px; }
-            #sendButton { position: absolute; top: 550px; left: 50px; }
+            #controls { position: absolute; top: 550px; left: 50px; }
+            button { margin: 5px; }
         </style>
     </head>
     <body>
         <h1>Live Drone Camera Stream</h1>
         <img src="/video_feed" width="640" height="480" id="videoCanvas">
         <canvas id="overlayCanvas" width="640" height="480"></canvas>
-        <button id="sendButton">Send Outage Points</button>
+        <div id="controls">
+            <label><input type="checkbox" id="yawCheckbox"> Yaw -90°</label>
+            <button id="movePlusX">+X</button>
+            <button id="moveMinusX">-X</button>
+            <button id="movePlusY">+Y</button>
+            <button id="moveMinusY">-Y</button>
+            <button id="sendButton">Send Outage Points</button>
+        </div>
         <script>
             const video = document.getElementById('videoCanvas');
             const canvas = document.getElementById('overlayCanvas');
             const ctx = canvas.getContext('2d');
+            const yawCheckbox = document.getElementById('yawCheckbox');
+            const movePlusX = document.getElementById('movePlusX');
+            const moveMinusX = document.getElementById('moveMinusX');
+            const movePlusY = document.getElementById('movePlusY');
+            const moveMinusY = document.getElementById('moveMinusY');
             const sendButton = document.getElementById('sendButton');
             let clicks = [];
 
@@ -95,7 +121,62 @@ def index():
                   });
             });
 
-            sendButton.addEventListener(' SEND_OUTAGE', () => {
+            yawCheckbox.addEventListener('change', () => {
+                fetch('/set_yaw', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({yaw_enabled: yawCheckbox.checked})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Yaw command sent:', data);
+                  });
+            });
+
+            movePlusX.addEventListener('click', () => {
+                fetch('/move_drone', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: 3, y: 0})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Move +X command sent:', data);
+                  });
+            });
+
+            moveMinusX.addEventListener('click', () => {
+                fetch('/move_drone', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: -3, y: 0})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Move -X command sent:', data);
+                  });
+            });
+
+            movePlusY.addEventListener('click', () => {
+                fetch('/move_drone', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: 0, y: 3})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Move +Y command sent:', data);
+                  });
+            });
+
+            moveMinusY.addEventListener('click', () => {
+                fetch('/move_drone', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({x: 0, y: -3})
+                }).then(response => response.json())
+                  .then(data => {
+                      console.log('Move -Y command sent:', data);
+                  });
+            });
+
+            sendButton.addEventListener('click', () => {
                 fetch('/send_outage', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -103,6 +184,8 @@ def index():
                 }).then(response => response.json())
                   .then(data => {
                       console.log('Outage points sent:', data);
+                      ctx.clearRect(0, 0, canvas.width, canvas.height);
+                      clicks = [];
                   });
             });
         </script>
@@ -134,6 +217,21 @@ def add_point():
         outage_points.append(global_pos)
         return jsonify({"status": "success", "point": global_pos}), 200
     return jsonify({"status": "error", "message": "No camera coords"}), 400
+
+@app.route('/set_yaw', methods=['POST'])
+def set_yaw():
+    global yaw_enabled
+    data = request.get_json()
+    with yaw_lock:
+        yaw_enabled = data.get('yaw_enabled', False)
+    return jsonify({"status": "success", "yaw_enabled": yaw_enabled}), 200
+
+@app.route('/move_drone', methods=['POST'])
+def move_drone():
+    data = request.get_json()
+    x = data.get('x', 0)
+    y = data.get('y', 0)
+    return jsonify({"status": "success", "x": x, "y": y}), 200
 
 @app.route('/send_outage', methods=['POST', 'GET'])
 def send_outage():
